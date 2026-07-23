@@ -234,7 +234,7 @@ func updateStatusBar() {
         iconView.frame = NSRect(x: 0, y: 1, width: getStatusBarWidth(), height: isMacOS14 ? 22 : 21)
         button.subviews = [iconView]
         button.frame = iconView.frame
-        button.setAccessibilityLabel("QuickRecorder")
+        button.setAccessibilityLabel("PasRodave")
         statusBarItem.isVisible = true
     }
 }

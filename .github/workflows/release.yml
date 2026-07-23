@@ -1,0 +1,155 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9]*.[0-9]*.[0-9]*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    env:
+      APP_NAME: PasRodave
+      PROJECT: QuickRecorder.xcodeproj
+      SCHEME: QuickRecorder
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate required secrets
+        env:
+          CERTIFICATE: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.BUILD_KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          for value in \
+            "$CERTIFICATE" \
+            "$CERTIFICATE_PASSWORD" \
+            "$KEYCHAIN_PASSWORD" \
+            "$APPLE_ID" \
+            "$APPLE_PASSWORD" \
+            "$APPLE_TEAM_ID" \
+            "$SPARKLE_PRIVATE_KEY"; do
+            test -n "$value"
+          done
+
+      - name: Import Developer ID certificate
+        env:
+          CERTIFICATE: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.BUILD_KEYCHAIN_PASSWORD }}
+        run: |
+          certificate_path="$RUNNER_TEMP/developer-id.p12"
+          keychain_path="$RUNNER_TEMP/build.keychain-db"
+          printf '%s' "$CERTIFICATE" | base64 -D > "$certificate_path"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security import "$certificate_path" \
+            -P "$CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$keychain_path"
+
+      - name: Build signed application
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          marketing_version="$(
+            xcodebuild \
+              -project "$PROJECT" \
+              -scheme "$SCHEME" \
+              -configuration Release \
+              -showBuildSettings |
+              awk '/MARKETING_VERSION/ { print $3; exit }'
+          )"
+          test "$marketing_version" = "$GITHUB_REF_NAME"
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Developer ID Application" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            build
+
+      - name: Notarize and staple
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          app_path="$RUNNER_TEMP/DerivedData/Build/Products/Release/$APP_NAME.app"
+          notarization_zip="$RUNNER_TEMP/$APP_NAME-notarization.zip"
+          ditto -c -k --keepParent "$app_path" "$notarization_zip"
+          xcrun notarytool submit "$notarization_zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          spctl --assess --type execute --verbose=2 "$app_path"
+
+      - name: Create signed Sparkle feed
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          app_path="$RUNNER_TEMP/DerivedData/Build/Products/Release/$APP_NAME.app"
+          release_dir="$RUNNER_TEMP/releases"
+          archive_name="$APP_NAME-$tag.zip"
+          mkdir -p "$release_dir"
+          ditto -c -k --keepParent "$app_path" "$release_dir/$archive_name"
+          cp appcast.xml "$release_dir/appcast.xml"
+          sparkle_tools="$RUNNER_TEMP/DerivedData/SourcePackages/artifacts/sparkle/Sparkle/bin"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" |
+            "$sparkle_tools/generate_appcast" \
+              --ed-key-file - \
+              --maximum-deltas 0 \
+              --download-url-prefix \
+              "https://github.com/${GITHUB_REPOSITORY}/releases/download/$tag/" \
+              "$release_dir"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          release_dir="$RUNNER_TEMP/releases"
+          gh release create "$tag" \
+            "$release_dir/$APP_NAME-$tag.zip" \
+            --verify-tag \
+            --title "$APP_NAME $tag" \
+            --generate-notes
+
+      - name: Publish updated appcast
+        run: |
+          release_dir="$RUNNER_TEMP/releases"
+          cp "$release_dir/appcast.xml" "$RUNNER_TEMP/appcast.xml"
+          git fetch origin main
+          git checkout main
+          cp "$RUNNER_TEMP/appcast.xml" appcast.xml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add appcast.xml
+          git diff --cached --quiet ||
+            git commit -m "Update appcast for ${GITHUB_REF_NAME}"
+          git push origin main

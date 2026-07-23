@@ -17,8 +17,8 @@ struct ContentViewNew: View {
     @State private var isPopoverShowing = false
     @State private var micList = SCContext.getMicrophone()
     @AppStorage("enableAEC") private var enableAEC: Bool = false
-    @AppStorage("recordMic") private var recordMic: Bool = false
-    @AppStorage("micDevice") private var micDevice: String = "default"
+    @AppStorage("recordMic") private var recordMic: Bool = true
+    @AppStorage("micDevice") private var micDevice: String = "MacBook Air Microphone"
     @AppStorage("showOnDock") private var showOnDock: Bool = true
     @AppStorage("showMenubar") private var showMenubar: Bool = false
 

@@ -13,6 +13,7 @@ import UserNotifications
 import SwiftLAME
 import SwiftUI
 import AECAudioStream
+import LAME
 
 class SCContext {
     static var trimingList = [URL]()
@@ -32,14 +33,21 @@ class SCContext {
     static var lastPTS: CMTime?
     static var timeOffset = CMTimeMake(value: 0, timescale: 0)
     static var screenArea: NSRect?
+    static let screenOutputQueue = DispatchQueue(label: "com.pythagorrre.PasRodave.screenOutput")
+    static let audioOutputQueue = DispatchQueue(label: "com.pythagorrre.PasRodave.audioOutput")
+    static let microphoneOutputQueue = DispatchQueue(label: "com.pythagorrre.PasRodave.microphoneOutput")
     static let audioEngine = AVAudioEngine()
     static let AECEngine = AECAudioStream(sampleRate: 48000)
+    static var isAECAudioStreamActive = false
+    static let mixedAudioHeadroom: Float = 0.5
     static var backgroundColor: CGColor = CGColor.black
     static var filePath: String!
     static var filePath1: String!
     static var filePath2: String!
+    static var audioPackageOutputBasePath: String?
     static var audioFile: AVAudioFile?
     static var audioFile2: AVAudioFile?
+    static var mp3Writer: Mp3StreamWriter?
     static var vW: AVAssetWriter!
     static var vwInput, awInput, micInput: AVAssetWriterInput!
     static var startTime: Date?
@@ -91,8 +99,10 @@ class SCContext {
     }
     
     static func updateAvailableContent(completion: @escaping () -> Void) {
+        NSLog("QRDBG: updateAvailableContent -> getExcludingDesktopWindows")
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { content, error in
             if let error = error {
+                NSLog("QRDBG: getExcludingDesktopWindows ERREUR: \(error.localizedDescription)")
                 switch error {
                 case SCStreamError.userDeclined: requestPermissions()
                 default: print("Error: failed to fetch available content: ".local, error.localizedDescription)
@@ -231,7 +241,7 @@ class SCContext {
         ud.setValue(false, forKey: "recordMic")
         DispatchQueue.main.async {
             let alert = createAlert(title: "Permission Required",
-                                                       message: "QuickRecorder needs permission to record your microphone.",
+                                                       message: "PasRodave needs permission to record your microphone.",
                                                        button1: "Open Settings",
                                                        button2: "Cancel")
             if alert.runModal() == .alertFirstButtonReturn {
@@ -243,7 +253,7 @@ class SCContext {
     private static func requestPermissions() {
         DispatchQueue.main.async {
             let alert = createAlert(title: "Permission Required",
-                                                       message: "QuickRecorder needs screen recording permissions, even if you only intend on recording audio.",
+                                                       message: "PasRodave needs screen recording permissions, even if you only intend on recording audio.",
                                                        button1: "Open Settings",
                                                        button2: "Cancel")
             if alert.runModal() == .alertFirstButtonReturn {
@@ -261,7 +271,7 @@ class SCContext {
         case .denied:
             DispatchQueue.main.async {
                 let alert = createAlert(title: "Permission Required",
-                                                           message: "QuickRecorder needs this permission to record your camera or mobile device.",
+                                                           message: "PasRodave needs this permission to record your camera or mobile device.",
                                                            button1: "Open Settings",
                                                            button2: "Cancel")
                 if alert.runModal() == .alertFirstButtonReturn {
@@ -342,7 +352,7 @@ class SCContext {
         if stream != nil { stream.stopCapture() }
         stream = nil
         if ud.bool(forKey: "recordMic") {
-            micInput.markAsFinished()
+            if mp3Writer == nil, micInput != nil { micInput.markAsFinished() }
             AudioRecorder.shared.stop()
             audioEngine.inputNode.removeTap(onBus: 0)
             audioEngine.stop()
@@ -385,7 +395,9 @@ class SCContext {
             }
             dispatchGroup.wait()
         } else {
-            if ud.bool(forKey: "recordMic") { vW.finishWriting {} }
+            if ud.bool(forKey: "recordMic") && mp3Writer == nil && vW != nil {
+                vW.finishWriting {}
+            }
         }
         
         DispatchQueue.main.async {
@@ -401,9 +413,23 @@ class SCContext {
         audioFile = nil // close audio file
         audioFile2 = nil // close audio file2
         if streamType == .systemaudio {
-            if ud.string(forKey: "audioFormat") == AudioFormat.mp3.rawValue && !ud.bool(forKey: "recordMic") {
+            if let writer = mp3Writer {
+                writer.finish()
+                mp3Writer = nil
+                if !ud.bool(forKey: "showPreview") {
+                    let title = "Recording Completed".local
+                    let body = String(format: "File saved to: %@".local, writer.url.path.removingPercentEncoding ?? writer.url.path)
+                    let id = "quickrecorder.completed.\(UUID().uuidString)"
+                    showNotification(title: title, body: body, id: id)
+                } else {
+                    let path = writer.url.path
+                    DispatchQueue.main.async {
+                        showPreview(path: path, image: NSImage(named: "audioIcon"))
+                    }
+                }
+            } else if ud.string(forKey: "audioFormat") == AudioFormat.mp3.rawValue && !ud.bool(forKey: "recordMic") {
                 Task {
-                    let outPutUrl = (String(filePath.dropLast(4)) + ".mp3").url
+                    let outPutUrl = (audioPackageOutputBasePath?.url ?? filePath.url.deletingPathExtension()).appendingPathExtension("mp3")
                     do {
                         try await m4a2mp3(inputUrl: filePath1.url, outputUrl: outPutUrl)
                         try? fd.removeItem(atPath: filePath1)
@@ -535,6 +561,9 @@ class SCContext {
     
     static func getCurrentMic() -> AVCaptureDevice? {
         let deviceName = ud.string(forKey: "micDevice")
+        if deviceName == nil || deviceName == "default" {
+            return AVCaptureDevice.default(for: .audio)
+        }
         return getMicrophone().first(where: { $0.localizedName == deviceName })
     }
     
@@ -835,5 +864,228 @@ class SCContext {
                 break
             }
         }
+    }
+}
+
+// Encodes the final MP3 while recording. System audio drives the timeline;
+// microphone samples are resampled and mixed from a bounded FIFO.
+final class Mp3StreamWriter {
+    private var lame: OpaquePointer?
+    private var fileHandle: FileHandle?
+    private var mp3Buffer: [UInt8]
+    private let mixMic: Bool
+    private let lock = NSLock()
+    private var micFifoL = [Float]()
+    private var micFifoR = [Float]()
+    private var micConverter: AVAudioConverter?
+    private var micConverterInputFormat: AVAudioFormat?
+    private let outputFormat: AVAudioFormat
+    private var micReadIndex = 0
+    private var systemBufferCount = 0
+    private var micBufferCount = 0
+    private var maximumSystemPeak: Float = 0
+    private var maximumMicPeak: Float = 0
+    private var loggedSystemSignal = false
+    private var loggedMicSignal = false
+    private var finished = false
+    let url: URL
+
+    init?(url: URL, sampleRate: Int = 48000, bitrate: Int, mixMic: Bool) {
+        guard let format = AVAudioFormat(
+            standardFormatWithSampleRate: Double(sampleRate),
+            channels: 2
+        ) else { return nil }
+        self.url = url
+        self.mixMic = mixMic
+        self.outputFormat = format
+        self.mp3Buffer = [UInt8](repeating: 0, count: 128 * 1024)
+
+        fd.createFile(atPath: url.path, contents: nil)
+        guard let handle = try? FileHandle(forWritingTo: url) else { return nil }
+        self.fileHandle = handle
+
+        guard let lame = lame_init() else {
+            try? handle.close()
+            return nil
+        }
+        lame_set_in_samplerate(lame, Int32(sampleRate))
+        lame_set_out_samplerate(lame, Int32(sampleRate))
+        lame_set_num_channels(lame, 2)
+        lame_set_brate(lame, Int32(max(64, min(320, bitrate))))
+        lame_set_VBR(lame, vbr_off)
+        lame_set_quality(lame, 2)
+        guard lame_init_params(lame) >= 0 else {
+            lame_close(lame)
+            try? handle.close()
+            return nil
+        }
+        self.lame = lame
+    }
+
+    func appendMic(_ buffer: AVAudioPCMBuffer) {
+        guard mixMic, buffer.frameLength > 0 else { return }
+        guard let converted = convertMicBuffer(buffer),
+              let data = converted.floatChannelData else { return }
+        let frames = Int(converted.frameLength)
+        guard frames > 0 else { return }
+        let left = data[0]
+        let right = converted.format.channelCount > 1 ? data[1] : data[0]
+        var peak: Float = 0
+        for index in 0..<frames {
+            peak = max(peak, abs(left[index]), abs(right[index]))
+        }
+
+        lock.lock()
+        if !finished {
+            micBufferCount += 1
+            maximumMicPeak = max(maximumMicPeak, peak)
+            if !loggedMicSignal && peak > 0.0001 {
+                loggedMicSignal = true
+                NSLog("QRDBG: signal micro détecté (peak=\(peak))")
+            }
+            micFifoL.append(contentsOf: UnsafeBufferPointer(start: left, count: frames))
+            micFifoR.append(contentsOf: UnsafeBufferPointer(start: right, count: frames))
+            let maxFrames = Int(outputFormat.sampleRate) * 5
+            let availableFrames = micFifoL.count - micReadIndex
+            if availableFrames > maxFrames {
+                micReadIndex += availableFrames - maxFrames
+            }
+            compactMicFifoIfNeeded()
+        }
+        lock.unlock()
+    }
+
+    func appendSystem(_ buffer: AVAudioPCMBuffer) {
+        guard let data = buffer.floatChannelData else { return }
+        let frames = Int(buffer.frameLength)
+        guard frames > 0 else { return }
+        let systemLeft = data[0]
+        let systemRight = buffer.format.channelCount > 1 ? data[1] : data[0]
+        var systemPeak: Float = 0
+        for index in 0..<frames {
+            systemPeak = max(
+                systemPeak,
+                abs(systemLeft[index]),
+                abs(systemRight[index])
+            )
+        }
+
+        var mixLeft = [Float](repeating: 0, count: frames)
+        var mixRight = [Float](repeating: 0, count: frames)
+
+        lock.lock()
+        defer { lock.unlock() }
+        guard !finished, let lame, let handle = fileHandle else { return }
+
+        systemBufferCount += 1
+        maximumSystemPeak = max(maximumSystemPeak, systemPeak)
+        if !loggedSystemSignal && systemPeak > 0.0001 {
+            loggedSystemSignal = true
+            NSLog("QRDBG: signal système détecté (peak=\(systemPeak))")
+        }
+
+        let availableMicFrames = micFifoL.count - micReadIndex
+        let take = mixMic ? min(frames, availableMicFrames) : 0
+        for index in 0..<frames {
+            var left = systemLeft[index]
+            var right = systemRight[index]
+            if index < take {
+                left = (left + micFifoL[micReadIndex + index]) * SCContext.mixedAudioHeadroom
+                right = (right + micFifoR[micReadIndex + index]) * SCContext.mixedAudioHeadroom
+            } else if mixMic {
+                left *= SCContext.mixedAudioHeadroom
+                right *= SCContext.mixedAudioHeadroom
+            }
+            mixLeft[index] = max(-1.0, min(1.0, left))
+            mixRight[index] = max(-1.0, min(1.0, right))
+        }
+        if take > 0 {
+            micReadIndex += take
+            compactMicFifoIfNeeded()
+        }
+
+        let needed = frames * 5 / 4 + 7200
+        if mp3Buffer.count < needed {
+            mp3Buffer = [UInt8](repeating: 0, count: needed)
+        }
+        let encoded = mp3Buffer.withUnsafeMutableBufferPointer { output -> Int32 in
+            mixLeft.withUnsafeBufferPointer { left in
+                mixRight.withUnsafeBufferPointer { right in
+                    lame_encode_buffer_ieee_float(
+                        lame,
+                        left.baseAddress,
+                        right.baseAddress,
+                        Int32(frames),
+                        output.baseAddress,
+                        Int32(output.count)
+                    )
+                }
+            }
+        }
+        if encoded > 0 {
+            handle.write(Data(bytes: mp3Buffer, count: Int(encoded)))
+        }
+    }
+
+    func finish() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !finished else { return }
+        finished = true
+        NSLog(
+            "QRDBG: fin MP3 — buffers système=\(systemBufferCount), peak système=\(maximumSystemPeak), buffers micro=\(micBufferCount), peak micro=\(maximumMicPeak)"
+        )
+        if let lame, let handle = fileHandle {
+            let encoded = mp3Buffer.withUnsafeMutableBufferPointer { output -> Int32 in
+                lame_encode_flush(lame, output.baseAddress, Int32(output.count))
+            }
+            if encoded > 0 {
+                handle.write(Data(bytes: mp3Buffer, count: Int(encoded)))
+            }
+            lame_close(lame)
+            try? handle.close()
+        }
+        lame = nil
+        fileHandle = nil
+        micFifoL = []
+        micFifoR = []
+        micReadIndex = 0
+    }
+
+    deinit { finish() }
+
+    private func compactMicFifoIfNeeded() {
+        guard micReadIndex >= 48_000 || micReadIndex == micFifoL.count else { return }
+        micFifoL.removeFirst(micReadIndex)
+        micFifoR.removeFirst(micReadIndex)
+        micReadIndex = 0
+    }
+
+    private func convertMicBuffer(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        if buffer.format == outputFormat { return buffer }
+        if micConverter == nil || micConverterInputFormat != buffer.format {
+            micConverter = AVAudioConverter(from: buffer.format, to: outputFormat)
+            micConverterInputFormat = buffer.format
+        }
+        guard let converter = micConverter else { return nil }
+        let ratio = outputFormat.sampleRate / buffer.format.sampleRate
+        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 64
+        guard let output = AVAudioPCMBuffer(
+            pcmFormat: outputFormat,
+            frameCapacity: capacity
+        ) else { return nil }
+        var consumed = false
+        var conversionError: NSError?
+        let status = converter.convert(to: output, error: &conversionError) { _, outputStatus in
+            if consumed {
+                outputStatus.pointee = .noDataNow
+                return nil
+            }
+            consumed = true
+            outputStatus.pointee = .haveData
+            return buffer
+        }
+        if status == .error { return nil }
+        return output
     }
 }

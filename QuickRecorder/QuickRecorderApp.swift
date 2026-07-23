@@ -117,8 +117,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate, SCStreamOu
     @AppStorage("showOnDock")       var showOnDock: Bool = true
     @AppStorage("showMenubar")      var showMenubar: Bool = false
     @AppStorage("enableAEC")        var enableAEC: Bool = false
-    @AppStorage("recordMic")        var recordMic: Bool = false
-    @AppStorage("micDevice")        var micDevice: String = "default"
+    @AppStorage("recordMic")        var recordMic: Bool = true
+    @AppStorage("micDevice")        var micDevice: String = "MacBook Air Microphone"
     @AppStorage("remuxAudio")       var remuxAudio: Bool = true
     @AppStorage("recordWinSound")   var recordWinSound: Bool = true
     @AppStorage("recordHDR")        var recordHDR: Bool = false
@@ -201,10 +201,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate, SCStreamOu
     func applicationWillFinishLaunching(_ notification: Notification) {
         scPerm = SCContext.updateAvailableContentSync() != nil
         
-        let process = NSWorkspace.shared.runningApplications.filter({ $0.bundleIdentifier == "com.lihaoyun6.QuickRecorder" })
+        let process = NSWorkspace.shared.runningApplications.filter({
+            $0.bundleIdentifier == Bundle.main.bundleIdentifier
+        })
         if process.count > 1 {
             DispatchQueue.main.async {
-                let button = createAlert(title: "QuickRecorder is Running".local, message: "Please do not run multiple instances!".local, button1: "Quit".local).runModal()
+                let button = createAlert(title: "PasRodave is Running".local, message: "Please do not run multiple instances!".local, button1: "Quit".local).runModal()
                 if button == .alertFirstButtonReturn { NSApp.terminate(self) }
             }
         }
@@ -230,7 +232,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate, SCStreamOu
                 "poSafeDelay": 1,
                 "saveDirectory": userDesktop as NSString,
                 "showMouse": true,
-                "recordMic": false,
+                "recordMic": true,
+                "micDevice": "MacBook Air Microphone",
                 "remuxAudio": isMacOS12 ? false : true,
                 "recordWinSound": isMacOS12 ? false : true,
                 "trimAfterRecord": false,
@@ -363,7 +366,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate, SCStreamOu
                 let width = isMacOS12 ? 800 : 928
                 let mainPanel = EscPanel(contentRect: NSRect(x: 0, y: 0, width: width + offset, height: 100), styleMask: [.fullSizeContentView, .nonactivatingPanel], backing: .buffered, defer: false)
                 mainPanel.contentView = NSHostingView(rootView: ContentView())
-                mainPanel.title = "QuickRecorder".local
+                mainPanel.title = "PasRodave".local
                 mainPanel.isOpaque = false
                 mainPanel.level = .floating
                 mainPanel.isRestorable = false
@@ -407,7 +410,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate, SCStreamOu
 }
 
 func closeMainWindow() {
-    for w in NSApp.windows.filter({ $0.title == "QuickRecorder".local }) {
+    for w in NSApp.windows.filter({ $0.title == "PasRodave".local }) {
         w.close()
     }
 }
@@ -548,7 +551,7 @@ extension NSMenuItem {
 
 extension NSImage {
     static func createScreenShot() -> NSImage? {
-        let excludedAppBundleIDs = ["com.lihaoyun6.QuickRecorder"]
+        let excludedAppBundleIDs = [Bundle.main.bundleIdentifier].compactMap { $0 }
         var exclusionPIDs = [Int]()
         for app in NSWorkspace.shared.runningApplications {
             if excludedAppBundleIDs.contains(app.bundleIdentifier ?? "") {
