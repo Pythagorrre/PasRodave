@@ -102,6 +102,7 @@ struct RecorderView: View {
     @AppStorage("hideDesktopFiles") private var hideDesktopFiles: Bool = false
     @AppStorage("trimAfterRecord")  private var trimAfterRecord: Bool = false
     @AppStorage("miniStatusBar")    private var miniStatusBar: Bool = false
+    @AppStorage("showRecordingController") private var showRecordingController: Bool = false
     @AppStorage("hideSelf")         private var hideSelf: Bool = true
     @AppStorage("preventSleep")     private var preventSleep: Bool = true
     @AppStorage("showPreview")      private var showPreview: Bool = true
@@ -128,7 +129,11 @@ struct RecorderView: View {
                 }
             }
             SGroupBox {
+                SToggle("Show floating recording controller", isOn: $showRecordingController)
+                    .onChange(of: showRecordingController) { _ in updateStatusBar() }
+                SDivider()
                 SToggle("Mini size Menu Bar controller", isOn: $miniStatusBar)
+                    .disabled(!showRecordingController)
                 SDivider()
                 SToggle("Prevent Mac from sleeping while recording", isOn: $preventSleep)
                 SDivider()

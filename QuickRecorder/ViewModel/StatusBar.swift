@@ -224,6 +224,11 @@ struct StatusBarItem: View {
 
 func updateStatusBar() {
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+        if SCContext.streamType != nil && !ud.bool(forKey: "showRecordingController") {
+            statusBarItem.isVisible = false
+            controlPanel.close()
+            return
+        }
         if SCContext.streamType == nil && !ud.bool(forKey: "showMenubar") {
             statusBarItem.isVisible = false
             return

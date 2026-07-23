@@ -239,6 +239,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate, SCStreamOu
                 "trimAfterRecord": false,
                 "showOnDock": true,
                 "showMenubar": false,
+                "showRecordingController": false,
                 "enableAEC": false,
                 "recordHDR": false,
                 "preventSleep": true,
